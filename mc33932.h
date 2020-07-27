@@ -11,7 +11,7 @@
 // when the mc33932 fault pin reads low there is a fault condition
 #define FAULT_LEVEL 0
 
-#define DEBUG_MC33932 1
+#define DEBUG_MC33932 0
 
 // number of analogReads to average together when measuring motor current
 #define AVERAGE_SAMPLES 64
@@ -51,8 +51,8 @@ class MC33932 {
     pinMode(M1_INB, OUTPUT);
     pinMode(M2_INA, OUTPUT);
     pinMode(M2_INB, OUTPUT);
-    setM1Dir(FORWARD);
-    setM2Dir(FORWARD);
+    setM1Dir(REVERSE);
+    setM2Dir(REVERSE);
     setM1Pwm(0);
     setM2Pwm(0);
     
@@ -132,10 +132,10 @@ class MC33932 {
     // called when the motor is at rest
     if( dir == FORWARD ){
       analogWrite(_m1PwmPin, 0);
-      _m1PwmPin = M1_INB;
+      _m1PwmPin = M1_INA;
     } else if( dir == REVERSE ){
       analogWrite(_m1PwmPin, 0);
-      _m1PwmPin = M1_INA;
+      _m1PwmPin = M1_INB;
     }
 
     _m1Dir = dir;
@@ -150,10 +150,10 @@ class MC33932 {
     // called when the motor is at rest
     if( dir == FORWARD ){
       analogWrite(_m2PwmPin, 0);
-      _m2PwmPin = M2_INA;
+      _m2PwmPin = M2_INB;
     } else if( dir == REVERSE ){
       analogWrite(_m2PwmPin, 0);
-      _m2PwmPin = M2_INB;
+      _m2PwmPin = M2_INA;
     }
 
     _m2Dir = dir;

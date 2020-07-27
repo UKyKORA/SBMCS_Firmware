@@ -1,5 +1,5 @@
 # SBMCS Firmware
-
+Developed on Ubuntu 20.04 with ROS Noetic.
 ## Installation
 
 ### Using arduino CLI
@@ -17,7 +17,24 @@ board_manager:
 ```
 - Update the board index with ```arduino-cli core update-index```
 
-### If not using arduino cli then just add the adafruit board url to the board manager that you access though the GUI
+### With Arduino IDE 
+If not using arduino cli then just add the adafruit board url to the board manager that you access though the GUI
+
+## Libraries and setup
+The arduino cli makes library install easy for most libs. One exception is the rosserial package. To install this library you must have a working ROS workspace  with the rosserial metapackage built. Once this is done, run
+```rosrun rosserial_arduino make_libraries.py PathToYourSketchbookLibraries```
+which will generate the arduino library needed. For more information on getting a ROS catkin workspace setup, see KORA's install script [here](https://github.com/UKyKORA/LunaRover/blob/master/doc/ros_setup.sh) and the [ROS intallation homepage](http://wiki.ros.org/ROS/Installation)
+
+Libraries to be downloaded by hand and placed in Arduino/libraries folder:
+- https://github.com/BriscoeTech/Arduino-FreeRTOS-SAMD51 
+- https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary
+
+Libraries to install with CLI:
+- Encoder: ```arduino-cli lib install Encoder```
+  - this one requires a few changes to get it to build on the SAMD51 chip this SBMCS uses. As of writing this, there is a [PR in limbo](https://github.com/PaulStoffregen/Encoder/pull/34) that incorporates changes needed to support the interrupts that the SAMD51G19A chip has. I applied changes in the first two commits of this PR (21cf690 and 430004a) to my local copy of the Encoder library and its working great.
+- PID: ```arduino-cli lib install PID```
+- Madgwick: ```arduino-cli lib install Madgwick```
+- NXPMotionSense ```arduino-cli lib install NXPMotionSense```
 
 ## Compilation
 

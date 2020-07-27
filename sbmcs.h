@@ -9,40 +9,39 @@
 
 #define AVERAGE_SAMPLES 64
 
+// rosserial hardware class for its comms 
+class SBMCS_Hardware : public ArduinoHardware
+{
+  public:
+  SBMCS_Hardware():ArduinoHardware(&Serial1, 115200){};
+};
+// end rosserial hardware class
+
 class SBMCS {
 
-
  public:
- SBMCS() : _vBatVoltage(0.0), _5vCurrent(0.0) {};
+ SBMCS() : vBatVoltage(0.0), currentDraw5v(0.0) {};
 
   // library init function
-  bool begin() {
-    Serial.print("SBMCS Library Starting...");
+  void begin() {
+    Serial.println("SBMCS Library Starting...");
 
     // set pin modes for LEDs, analog sensing and imu interrupts
-    _initGpio();
+    pinMode(IMU_INT, INPUT);
+    pinMode(SERVO_PWM, OUTPUT);
+    pinMode(ACT_LED, OUTPUT);
+    pinMode(STAT_LED, OUTPUT);
 
-    // init servo library
-    // must be using the servo library that comes with adafruits
-    // board support package. Other servo libs do not support the
-    // samd51 timer structure
-    servo.attach(SERVO_PWM);
-
-    // init mc33932 dual h bridge control library
-    motors.begin();    
+    pinMode(VBAT_SENSE, INPUT);
+    pinMode(I5V_SENSE, INPUT);
   };
 
-  // set servo position in degrees
-  void setServoPosition(int pos) {
-    servo.write(pos);
-  };
-
-  unsigned long enc1() {
-    return _m1.read();
+  int32_t enc1() {
+    return m1.read();
   }
 
-  unsigned long enc2() {
-    return _m2.read();
+  int32_t enc2() {
+    return m2.read();
   }
   
   // read vbat battery voltage
@@ -54,9 +53,9 @@ class SBMCS {
     
     // the battery voltage is sensed through a voltage divider
     // 300k to vbat 80k to gnd
-    _vBatVoltage = ( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3 *  380.0 / 80.0;
+    vBatVoltage = ( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3 *  380.0 / 80.0;
 
-    return _vBatVoltage;
+    return vBatVoltage;
   };
 
   // read current drawn from 5v rail
@@ -66,30 +65,17 @@ class SBMCS {
       i1 += analogRead(I5V_SENSE);
     };
 
-    _5vCurrent = abs( 2.5 - (( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3)) / 2.5 * 5;
+    currentDraw5v = abs( 2.5 - (( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3)) / 2.5 * 5;
 
-    return _5vCurrent;
+    return currentDraw5v;
   };
-  
-  MC33932 motors;
-  Servo servo;
- private:
-  void _initGpio() {
-    pinMode(IMU_INT, INPUT);
-    pinMode(SERVO_PWM, OUTPUT);
-    pinMode(ACT_LED, OUTPUT);
-    pinMode(STAT_LED, OUTPUT);
 
-    pinMode(VBAT_SENSE, INPUT);
-    pinMode(I5V_SENSE, INPUT);
-  }
-
-  static Encoder _m1;
-  static Encoder _m2;
-  float _vBatVoltage, _5vCurrent;
+  static Encoder m1;
+  static Encoder m2;
+  float vBatVoltage, currentDraw5v;
 };
 
-Encoder SBMCS::_m1 = Encoder(M1_ENC_A, M1_ENC_B);
-Encoder SBMCS::_m2 = Encoder(M2_ENC_A, M2_ENC_B);
+Encoder SBMCS::m1 = Encoder(M1_ENC_A, M1_ENC_B);
+Encoder SBMCS::m2 = Encoder(M2_ENC_A, M2_ENC_B);
 
 #endif
