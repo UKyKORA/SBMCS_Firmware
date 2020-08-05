@@ -11,14 +11,19 @@
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Quaternion.h>
 #include <geometry_msgs/Twist.h>
+#include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
-#include <std_msgs/Int32.h>
+#include <rover_msgs/SBMCTelemReading.h>
+#include <rover_msgs/SBMCServoSetting.h>
 
 #include <MadgwickAHRS.h>
 #include "ICM_20948.h"
 
+// rtos delay helpers
+#include "include/delay_helpers.h"
 
-#include "sbmcs.h"
+// sbmc shield control and motor driver
+#include "include/sbmcs.h"
 
 #define DEBUG 1
 
@@ -28,11 +33,6 @@
 #define SERIAL_PORT Serial
 #define WIRE_PORT Wire
 #define AD0_VAL   0
-
-
-// rtos delay helpers
-#include "delay_helpers.h"
-
 
 // ROBOT PARAMS
 // for 165 rpm servo city plantetary gear motor with encoder
@@ -96,8 +96,8 @@ void twistCb( const geometry_msgs::Twist &cmdVel ){
   m2Setpoint = vl; //cmdVel.linear.y;
 }
 
-void servoCb( const std_msgs::Int32 &pos) {
-  servo.write(max(0, min(pos.data,180))); 
+void servoCb( const rover_msgs::SBMCServoSetting &pos) {
+  servo.write(max(0, min(pos.position,180))); 
 }
 
 // rosserial pubs, subcs and messages
@@ -105,15 +105,19 @@ ros::NodeHandle nh; //_<SBMCS_Hardware,5, 5, 512, 512>
 geometry_msgs::TransformStamped t;
 tf::TransformBroadcaster broadcaster;
 sensor_msgs::Imu imu_msg;
+nav_msgs::Odometry odom_msg;
+rover_msgs::SBMCTelemReading telem_msg;
 ros::Publisher pub_imu( "imu_data", &imu_msg);
+ros::Publisher pub_odom( "odom", &odom_msg);
+ros::Publisher pub_telem( "sbmc_telem", &telem_msg);
 ros::Subscriber<geometry_msgs::Twist> sub_drive("/drive_setting", twistCb);
-ros::Subscriber<std_msgs::Int32> sub_servo("/servo_setting", servoCb);
+ros::Subscriber<rover_msgs::SBMCServoSetting> sub_servo("/servo_setting", servoCb);
 
 // IMU frame, need a transformer for this to base_link or odom??
-char frame_id[] = "sbmcs_imu";
+char imu_frame_id[] = "sbmcs_imu";
 // odom frame
-char base_link[] = "/base_link";
-char odom[] = "/odom";
+char base_link[] = "base_link";
+char odom[] = "odom";
 
 void ledErr() {
   digitalWrite(STAT_LED, HIGH);
@@ -145,7 +149,7 @@ void setServoPosition(int pos) {
 void initializeIMU()
 {
   // setup ros message
-  imu_msg.header.frame_id =  frame_id;
+  imu_msg.header.frame_id =  imu_frame_id;
   imu_msg.linear_acceleration.x = 0;
   imu_msg.linear_acceleration.y = 0;
   imu_msg.linear_acceleration.z = 0;
@@ -153,10 +157,11 @@ void initializeIMU()
   imu_msg.angular_velocity.y = 0;
   imu_msg.angular_velocity.z = 0;
   
-   WIRE_PORT.begin();
-   //WIRE_PORT.setClock(400000);
+  WIRE_PORT.begin();
+  //WIRE_PORT.setClock(400000);
    
-   bool initialized = false;
+  // TODO: return initialized 
+  bool initialized = false;
   while( !initialized ){
     ledErr();
     myICM.begin( WIRE_PORT, AD0_VAL );
@@ -217,13 +222,13 @@ void initializeIMU()
   // Set full scale ranges for both acc and gyr
   ICM_20948_fss_t myFSS;  // This uses a "Full Scale Settings" structure that can contain values for all configurable sensors
   
-  myFSS.a = gpm2;         // (ICM_20948_ACCEL_CONFIG_FS_SEL_e)
+  myFSS.a = gpm4;         // (ICM_20948_ACCEL_CONFIG_FS_SEL_e)
                           // gpm2
                           // gpm4
                           // gpm8
                           // gpm16
                           
-  myFSS.g = dps500;       // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
+  myFSS.g = dps1000;       // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
                           // dps250
                           // dps500
                           // dps1000
@@ -491,6 +496,7 @@ static void odomThread( void *pvParameters )
   
   while(1) {
     // odometry calculation
+    // TODO: make shield mutex, and encoder reading helper func
     enc1Value = shield.enc1();
     enc2Value = shield.enc2();
 
@@ -514,7 +520,7 @@ static void odomThread( void *pvParameters )
     float dist = (enc2Dist + enc1Dist) / 2.0;
 
 
-    Serial.print("dist: "); Serial.println(dist);
+    //Serial.print("dist: "); Serial.println(dist);
     
     float dTime = 0.1;
     float dTheta = 0.0;
@@ -537,11 +543,11 @@ static void odomThread( void *pvParameters )
     float velX = dist / dTime;
     float velTheta = dTheta / dTime;
 
-    Serial.print("velX: "); Serial.print(velX);
-    Serial.print("\nvelTheta: "); Serial.println(velTheta);
+    //Serial.print("velX: "); Serial.print(velX);
+    //Serial.print("\nvelTheta: "); Serial.println(velTheta);
     
     
-    // fill in transform info
+    // fill in transform fields
     t.header.frame_id = odom;
     t.child_frame_id = base_link;
   
@@ -550,14 +556,48 @@ static void odomThread( void *pvParameters )
     
     t.transform.rotation = tf::createQuaternionFromYaw(curTheta);
     
+    odom_msg.header.frame_id = odom;
+
+    odom_msg.pose.pose.position.x = curX;
+    odom_msg.pose.pose.position.y = curY;
+    odom_msg.pose.pose.position.z = 0.0;
+
+    odom_msg.pose.covariance[0] = 0.01;
+    odom_msg.pose.covariance[7] = 0.01;
+    odom_msg.pose.covariance[14] = 99999;
+    odom_msg.pose.covariance[21] = 99999;
+    odom_msg.pose.covariance[28] = 99999;
+    odom_msg.pose.covariance[35] = 0.01;
+
+    odom_msg.child_frame_id = base_link;
+    odom_msg.twist.twist.linear.x = velX;
+    odom_msg.twist.twist.linear.y = 0;
+    odom_msg.twist.twist.angular.z = velTheta;
+    //odom_msg.twist.covariance = odom.pose.covariance;
+    odom_msg.twist.covariance[0] = 0.01;
+    odom_msg.twist.covariance[7] = 0.01;
+    odom_msg.twist.covariance[14] = 99999;
+    odom_msg.twist.covariance[21] = 99999;
+    odom_msg.twist.covariance[28] = 99999;
+    odom_msg.twist.covariance[35] = 0.01;
     
     // acquire semaphore for rosserial and send transform message
     // TODO: how long to wait ? posssibly just as long as we dont
     //       overrun the following delay?
+    // Timestamps are set inside this mutex because the the now() 
+    //        function uses the node handle object
     if ( xSemaphoreTake( rsSem, ( TickType_t ) 5 ) == pdTRUE ) {
-      // publish the transform
+      // publish the transform from base_link to odom
       t.header.stamp = nh.now();
       broadcaster.sendTransform(t);
+      
+      // publish an Odometry message in the odom frame
+      odom_msg.header.stamp = nh.now();
+      // set orientation inside the mutex so we dont read a mangled 
+      // quat due to imu thread getting time sliced
+      odom_msg.pose.pose.orientation = imu_msg.orientation;
+      pub_odom.publish(&odom_msg);
+      
       nh.spinOnce();
       xSemaphoreGive( rsSem ); // Now free or "Give" the Serial Port for others.
     }
@@ -569,6 +609,13 @@ static void odomThread( void *pvParameters )
   }
 
 }
+
+//*************************************************************************************
+// Motor thread, creates telemetry on motor currents and battery voltage, as well
+// as system 5v current draw
+// TODO: create separate telemetry thread or rename this thread to be more telemetry in
+//       general
+//*************************************************************************************
 
 static void motorThread( void *pvParameters )
 {
@@ -672,11 +719,14 @@ static void imuThread( void *pvParameters )
       q.z = s1 * c2 * c3 + c1 * s2 * s3;
       q.w = c1 * s2 * c3 - s1 * c2 * s3;
       
-      imu_msg.orientation = q;
-      
       // check rosserial publish semaphore wait 5 ticks if not available
       if ( xSemaphoreTake( rsSem, ( TickType_t ) 5 ) == pdTRUE ) {
-        // do the pub
+        // TODO: quick and dirty way to not have a separate mutex just for the quat
+        //       keeps odom thread from possibly interfering while
+        //       grabbing the most recent orientation for the Odometry message
+        imu_msg.orientation = q;
+        
+        // publish the imu message 
         pub_imu.publish(&imu_msg);
         nh.spinOnce();
         xSemaphoreGive( rsSem ); // Now free or "Give" the Serial Port for others.
@@ -700,16 +750,18 @@ void setup()
   Serial.begin(115200);
   delay(3000);
   
-  Serial.println("Startin..");
+  Serial.println("Starting..");
   
   pinMode(STAT_LED, OUTPUT);
   pinMode(ACT_LED, OUTPUT);
   
   ledErr();
-  nh.getHardware()->setBaud(256000);  
+  nh.getHardware()->setBaud(128000);  
   nh.initNode();
   broadcaster.init(nh);
   nh.advertise(pub_imu);
+  nh.advertise(pub_odom);
+  nh.advertise(pub_telem);
   nh.subscribe(sub_drive);
   nh.subscribe(sub_servo);
   ledOk();

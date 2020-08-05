@@ -52,8 +52,8 @@ class SBMCS {
     };
     
     // the battery voltage is sensed through a voltage divider
-    // 300k to vbat 80k to gnd
-    vBatVoltage = ( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3 *  380.0 / 80.0;
+    // 300k to vbat 84.5k to gnd
+    vBatVoltage = ( (float)i1/AVERAGE_SAMPLES ) / 1023.0 * 3.3 *  380.0 / 84.5;
 
     return vBatVoltage;
   };
