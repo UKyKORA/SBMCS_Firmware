@@ -1,5 +1,11 @@
 /* 
- * SBMCS Motor Firmware
+ * Small Bot Motor Controller Firmware
+ * 
+ * Matt Ruffner @ KORA, 2020
+ *
+ * The controller firmware drives two motors to a setpoint in m/s using a separate PI
+ * controller for each. Wheel odometry is interpolated from quadrature motor encoder
+ * feedback.
  */
 #include <FreeRTOS_SAMD51.h>
 #include <semphr.h>
@@ -7,21 +13,19 @@
 #include <ros.h>
 #include <ros/time.h>
 #include <tf/tf.h>
-
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Quaternion.h>
 #include <geometry_msgs/Twist.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Odometry.h>
-#include <sensor_msgs/Imu.h>
 #include <rover_msgs/SBMCTelemReading.h>
 #include <rover_msgs/SBMCServoSetting.h>
-
-#include <MadgwickAHRS.h>
-#include "ICM_20948.h"
+#include <DPEng_ICM20948_AK09916.h>
+#include <Mahony_DPEng.h>
+#include <Madgwick_DPEng.h>
 
 // rtos delay helpers
 #include "include/delay_helpers.h"
-
 // sbmc shield control and motor driver
 #include "include/sbmcs.h"
 
@@ -33,6 +37,8 @@
 #define SERIAL_PORT Serial
 #define WIRE_PORT Wire
 #define AD0_VAL   0
+#define IMU_ADDR 0x68 // aka AD0 = LOW/0
+#define IMU_PERIOD 10 // milliseconds
 
 // ROBOT PARAMS
 // for 165 rpm servo city plantetary gear motor with encoder
@@ -44,6 +50,7 @@
 #define BASE_WIDTH 0.352 // meters
 // encoder counts per meter
 #define ENCODER_CPM 5220.0 // in counts
+#define MIN_SPD_THRESH 0.005 // slowest we are willing to go in m/s
 
 // shield library interface
 SBMCS shield;
@@ -51,15 +58,37 @@ Servo servo;
 MC33932 motors;
 
 // IMU reading and orientation filtering
-ICM_20948_I2C myICM;
+// Create sensor instance and variables to hold IMU 
+// calibration offsets
+DPEng_ICM20948 myICM = DPEng_ICM20948(0x948A, 0x948B, 0x948C);
+// Offsets applied to raw x/y/z mag values
+float mag_offsets[3]            = { -1.76F, 22.54F, 4.43F };
 
-Madgwick filter;
+// Soft iron error compensation matrix
+float mag_softiron_matrix[3][3] = { {  0.954,  -0.019,  0.003 },
+                                    {  -0.019,  1.059, -0.009 },
+                                    {  0.003,  -0.009,  0.990 } };
 
+float mag_field_strength        = 29.85F;
+
+// Offsets applied to compensate for gyro zero-drift error for x/y/z
+float gyro_zero_offsets[3]      = { 0.0F, 0.0F, 0.0F };
+
+// Mahony is lighter weight as a filter and should be used
+// on slower systems
+Mahony_DPEng filter;
+//Madgwick_DPEng filter;
+
+// motor safety timestamp, cut off motors if we havent received a twist in a while
+// needs work on ROS side,  need to send a twist every second to keep this happy
+// so just dont use it for now
+//volatile unsigned long lastTwistStamp = 0;
 
 // begin PID control interface and tunings
 // need mutexes for these 
 double m1Setpoint, m1Input, m1Output;
 double m2Setpoint, m2Input, m2Output;
+volatile double m1TargetVel, m2TargetVel;
 
 //Define the aggressive and conservative Tuning Parameters
 double consKp=0.1, consKi=4, consKd=0.0;
@@ -71,7 +100,7 @@ PID m2PID(&m2Input, &m2Output, &m2Setpoint, consKp, consKi, consKd, DIRECT);
 
 //**************************************************************************
 // freertos task handles
-TaskHandle_t Handle_motorTask;
+TaskHandle_t Handle_telemTask;
 TaskHandle_t Handle_speedTask;
 TaskHandle_t Handle_imuTask;
 TaskHandle_t Handle_monitorTask;
@@ -82,8 +111,8 @@ SemaphoreHandle_t rsSem;
 SemaphoreHandle_t dbSem;
 
 
-
-// callback for setting drive velocity
+//*****************************************************************
+// rosserial callback for setting drive velocity
 void twistCb( const geometry_msgs::Twist &cmdVel ){
   // joy_twist_remap was need to send linear.x and angular.z
   
@@ -92,38 +121,50 @@ void twistCb( const geometry_msgs::Twist &cmdVel ){
   float vr = linear_x + cmdVel.angular.z * BASE_WIDTH / 2.0;
   float vl = linear_x - cmdVel.angular.z * BASE_WIDTH / 2.0;
 
-  m1Setpoint = vr; //cmdVel.linear.y;
-  m2Setpoint = vl; //cmdVel.linear.y;
+  m1TargetVel = vr; //cmdVel.linear.y;
+  m2TargetVel = vl; //cmdVel.linear.y;
+  //lastTwistStamp = millis();
+  ledErr(); // TODO: not an erro, just want red blink
+            // need rename/rework led indication
 }
+//*****************************************************************
 
+
+
+
+//*****************************************************************
+// rosserial callback for setting servo position
 void servoCb( const rover_msgs::SBMCServoSetting &pos) {
   servo.write(max(0, min(pos.position,180))); 
 }
+//*****************************************************************
 
-// rosserial pubs, subcs and messages
+
+
+// rosserial pubs, subs and messages
 ros::NodeHandle nh; //_<SBMCS_Hardware,5, 5, 512, 512>
 geometry_msgs::TransformStamped t;
 tf::TransformBroadcaster broadcaster;
-sensor_msgs::Imu imu_msg;
+geometry_msgs::PoseStamped imu_msg;
 nav_msgs::Odometry odom_msg;
 rover_msgs::SBMCTelemReading telem_msg;
-ros::Publisher pub_imu( "imu_data", &imu_msg);
+ros::Publisher pub_imu( "imu", &imu_msg);
 ros::Publisher pub_odom( "odom", &odom_msg);
-ros::Publisher pub_telem( "sbmc_telem", &telem_msg);
+ros::Publisher pub_telem( "telem", &telem_msg);
 ros::Subscriber<geometry_msgs::Twist> sub_drive("/drive_setting", twistCb);
 ros::Subscriber<rover_msgs::SBMCServoSetting> sub_servo("/servo_setting", servoCb);
 
 // IMU frame, need a transformer for this to base_link or odom??
 char imu_frame_id[] = "sbmcs_imu";
 // odom frame
-char base_link[] = "base_link";
-char odom[] = "odom";
+char base_link_frame_id[] = "base_link";
+char odom_frame_id[] = "odom";
 
 void ledErr() {
   digitalWrite(STAT_LED, HIGH);
-  digitalWrite(ACT_LED, LOW);
 }
 void ledOk() {
+  digitalWrite(STAT_LED, LOW);
   ledOk(false);
 }
 void ledOk(bool toggle) {
@@ -149,27 +190,13 @@ void setServoPosition(int pos) {
 void initializeIMU()
 {
   // setup ros message
-  imu_msg.header.frame_id =  imu_frame_id;
-  imu_msg.linear_acceleration.x = 0;
-  imu_msg.linear_acceleration.y = 0;
-  imu_msg.linear_acceleration.z = 0;
-  imu_msg.angular_velocity.x = 0;
-  imu_msg.angular_velocity.y = 0;
-  imu_msg.angular_velocity.z = 0;
-  
-  WIRE_PORT.begin();
-  //WIRE_PORT.setClock(400000);
+  imu_msg.header.frame_id =  odom_frame_id;
    
   // TODO: return initialized 
   bool initialized = false;
   while( !initialized ){
     ledErr();
-    myICM.begin( WIRE_PORT, AD0_VAL );
-
-    //SERIAL_PORT.print( F("Initialization of the sensor returned: ") );
-    //SERIAL_PORT.println( myICM.statusString() );
-    if( myICM.status != ICM_20948_Stat_Ok ){
-      //SERIAL_PORT.println( "Trying again..." );
+    if( !myICM.begin(ICM20948_ACCELRANGE_4G, GYRO_RANGE_1000DPS, ICM20948_ACCELLOWPASS_50_4_HZ, IMU_ADDR) ){
       ledErr();
       delay(500);
     }else{
@@ -178,112 +205,9 @@ void initializeIMU()
     ledOk();
   }
   ledOk();
-    
-    
-  // In this advanced example we'll cover how to do a more fine-grained setup of your sensor
-  //SERIAL_PORT.println("Device connected!");
 
-  // Here we are doing a SW reset to make sure the device starts in a known state
-  myICM.swReset( );
-  if( myICM.status != ICM_20948_Stat_Ok){
-    //SERIAL_PORT.print(F("Software Reset returned: "));
-    //SERIAL_PORT.println(myICM.statusString());
-    ledErr();
-  }
-  delay(250);
-  
-  // Now wake the sensor up
-  myICM.sleep( false );
-  myICM.lowPower( false );
-
-  // setup sample mode and check return status
-  ledErr();
-  myICM.setSampleMode( (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr ), ICM_20948_Sample_Mode_Continuous); 
-  if( myICM.status != ICM_20948_Stat_Ok){
-    //SERIAL_PORT.print(F("setSampleMode returned: "));
-    //SERIAL_PORT.println(myICM.statusString());
-    ledErr();
-  }
-  ledOk();
-  
-  // 1125 Hz / (1 + SAMPLE_RATE_DIV) where SAMPLE_RATE_DIV=14 => 75Hz output data rate
-  ledErr();
-  ICM_20948_smplrt_t sample_rates;
-  sample_rates.a = 50;
-  sample_rates.g = 50;
-  myICM.setSampleRate( (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr ), sample_rates ); 
-  if( myICM.status != ICM_20948_Stat_Ok){
-    //SERIAL_PORT.print(F("setSampleRate returned: "));
-    //SERIAL_PORT.println(myICM.statusString());
-    ledErr();
-  }
-  ledOk();
-
-  // Set full scale ranges for both acc and gyr
-  ICM_20948_fss_t myFSS;  // This uses a "Full Scale Settings" structure that can contain values for all configurable sensors
-  
-  myFSS.a = gpm4;         // (ICM_20948_ACCEL_CONFIG_FS_SEL_e)
-                          // gpm2
-                          // gpm4
-                          // gpm8
-                          // gpm16
-                          
-  myFSS.g = dps1000;       // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
-                          // dps250
-                          // dps500
-                          // dps1000
-                          // dps2000
-  ledErr();                          
-  myICM.setFullScale( (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), myFSS );  
-  if( myICM.status != ICM_20948_Stat_Ok){
-    //SERIAL_PORT.print(F("setFullScale returned: "));
-    //SERIAL_PORT.println(myICM.statusString());
-    ledErr();
-  }
-  ledOk();
-
-  // Set up Digital Low-Pass Filter configuration
-  ICM_20948_dlpcfg_t myDLPcfg;            // Similar to FSS, this uses a configuration structure for the desired sensors
-  myDLPcfg.a = acc_d23bw9_n34bw4;         // (ICM_20948_ACCEL_CONFIG_DLPCFG_e)
-                                          // acc_d246bw_n265bw      - means 3db bandwidth is 246 hz and nyquist bandwidth is 265 hz
-                                          // acc_d111bw4_n136bw
-                                          // acc_d50bw4_n68bw8
-                                          // acc_d23bw9_n34bw4
-                                          // acc_d11bw5_n17bw
-                                          // acc_d5bw7_n8bw3        - means 3 db bandwidth is 5.7 hz and nyquist bandwidth is 8.3 hz
-                                          // acc_d473bw_n499bw
-
-  myDLPcfg.g = gyr_d361bw4_n376bw5;       // (ICM_20948_GYRO_CONFIG_1_DLPCFG_e)
-                                          // gyr_d196bw6_n229bw8
-                                          // gyr_d151bw8_n187bw6
-                                          // gyr_d119bw5_n154bw3
-                                          // gyr_d51bw2_n73bw3
-                                          // gyr_d23bw9_n35bw9
-                                          // gyr_d11bw6_n17bw8
-                                          // gyr_d5bw7_n8bw9
-                                          // gyr_d361bw4_n376bw5
-  ledErr();
-  myICM.setDLPFcfg( (ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), myDLPcfg );
-  if( myICM.status != ICM_20948_Stat_Ok){
-    //SERIAL_PORT.print(F("setDLPcfg returned: "));
-    //SERIAL_PORT.println(myICM.statusString());
-    ledErr();
-  }
-  ledOk();
-  
-  // Choose whether or not to use DLPF
-  // Here we're also showing another way to access the status values, and that it is OK to supply individual sensor masks to these functions
-  ICM_20948_Status_e accDLPEnableStat = myICM.enableDLPF( ICM_20948_Internal_Acc, true );
-  ICM_20948_Status_e gyrDLPEnableStat = myICM.enableDLPF( ICM_20948_Internal_Gyr, true );
-  //SERIAL_PORT.print(F("Enable DLPF for Accelerometer returned: ")); SERIAL_PORT.println(myICM.statusString(accDLPEnableStat));
-  //SERIAL_PORT.print(F("Enable DLPF for Gyroscope returned: ")); SERIAL_PORT.println(myICM.statusString(gyrDLPEnableStat));
-
-  //SERIAL_PORT.println();
-  //SERIAL_PORT.println(F("Configuration complete!")); 
-  ledOk();
-  
-  // expecting data at 75hz
-  filter.begin(23);
+  // expecting data at 100hz
+  filter.begin();
 }
 
 //*****************************************************************
@@ -334,7 +258,7 @@ void taskMonitor(void *pvParameters)
 	    SERIAL.println("****************************************************");
 	    SERIAL.println("[Stacks Free Bytes Remaining] ");
 
-	    measurement = uxTaskGetStackHighWaterMark( Handle_motorTask );
+	    measurement = uxTaskGetStackHighWaterMark( Handle_telemTask );
 	    SERIAL.print("Motor Controller Monitoring: ");
 	    SERIAL.println(measurement);
 
@@ -411,12 +335,25 @@ static void speedThread( void *pvParameters )
     }*/
     
     myDelayMs(20);
+    
+    // TODO: impliment better heartbeat to avoid motors running 
+    // during a comms blackout
+    // check that we get at least one twist per second
+    //if (millis() - lastTwistStamp > 1000) {
+    //  m1Setpoint = 0;
+    //  m2Setpoint = 0;
+    //}
 
     // keep the PID controller from whining the motors
-    if( m1Setpoint == 0 && m2Setpoint == 0)
-      motors.disable();
+    if( abs(m1Setpoint) < MIN_SPD_THRESH )
+      motors.disableM1();
+    else 
+      motors.enableM1();
+    
+    if( abs(m2Setpoint) < MIN_SPD_THRESH )
+      motors.disableM2();
     else
-      motors.enable();
+      motors.enableM2();
 
     enc1Value = shield.enc1();
     enc2Value = shield.enc2();
@@ -429,6 +366,8 @@ static void speedThread( void *pvParameters )
     float m1Spd = 50 * enc1Diff / ENCODER_CPR * WHEEL_CIRC;
     float m2Spd = 50 * enc2Diff / ENCODER_CPR * WHEEL_CIRC;
 
+    m1Setpoint = m1TargetVel;
+    m2Setpoint = m2TargetVel;
     m1Input = (double)m1Spd;
     m2Input = (double)m2Spd;
 
@@ -436,17 +375,14 @@ static void speedThread( void *pvParameters )
     m2PID.Compute();
 
 
-    // TODO: this jerks the motors on startup 
+    // TODO: do another speed calibration that includes both
+    //       directions. inverting  a one directional mapping like
+    //       this jerks the motors on speeds close to zero sometimes 
     float m1PwmEstimate = 195.414*m1Output*2.0 + 6.73-255;
     float m2PwmEstimate = 189.719*m2Output*2.0 + 5.49-255;
     m1PwmEstimate = max(-255, min(m1PwmEstimate, 255));
     m2PwmEstimate = max(-255, min(m2PwmEstimate, 255));
 
-    //Serial.print("m1 pwm estimate: ");
-    //Serial.print(m1PwmEstimate);
-    //Serial.print("\nm2 pwm estimate: ");
-    //Serial.println(m2PwmEstimate);
-    
     // set motor direction based on sign of setpoint
     // this method might cause jerkiness
     if( m1PwmEstimate > 0 ) {
@@ -462,14 +398,6 @@ static void speedThread( void *pvParameters )
     
     motors.setM1Pwm(abs(m1PwmEstimate));
     motors.setM2Pwm(abs(m2PwmEstimate));
-    
-    /*    if ( xSemaphoreTake( dbSem, ( TickType_t ) 1000 ) == pdTRUE ) {
-      Serial.print(m1Spd);
-      Serial.print('\t');
-      Serial.print(m2Spd);
-      Serial.print('\n');
-      xSemaphoreGive( dbSem );
-      }*/
   }
   
   vTaskDelete( NULL );
@@ -548,15 +476,15 @@ static void odomThread( void *pvParameters )
     
     
     // fill in transform fields
-    t.header.frame_id = odom;
-    t.child_frame_id = base_link;
+    t.header.frame_id = odom_frame_id;
+    t.child_frame_id = base_link_frame_id;
   
     t.transform.translation.x = curX;
     t.transform.translation.y = curY;
     
     t.transform.rotation = tf::createQuaternionFromYaw(curTheta);
     
-    odom_msg.header.frame_id = odom;
+    odom_msg.header.frame_id = odom_frame_id;
 
     odom_msg.pose.pose.position.x = curX;
     odom_msg.pose.pose.position.y = curY;
@@ -569,7 +497,7 @@ static void odomThread( void *pvParameters )
     odom_msg.pose.covariance[28] = 99999;
     odom_msg.pose.covariance[35] = 0.01;
 
-    odom_msg.child_frame_id = base_link;
+    odom_msg.child_frame_id = base_link_frame_id;
     odom_msg.twist.twist.linear.x = velX;
     odom_msg.twist.twist.linear.y = 0;
     odom_msg.twist.twist.angular.z = velTheta;
@@ -586,20 +514,19 @@ static void odomThread( void *pvParameters )
     //       overrun the following delay?
     // Timestamps are set inside this mutex because the the now() 
     //        function uses the node handle object
-    if ( xSemaphoreTake( rsSem, ( TickType_t ) 5 ) == pdTRUE ) {
+    if ( xSemaphoreTake( rsSem, ( TickType_t ) 10 ) == pdTRUE ) {
       // publish the transform from base_link to odom
       t.header.stamp = nh.now();
       broadcaster.sendTransform(t);
       
       // publish an Odometry message in the odom frame
       odom_msg.header.stamp = nh.now();
-      // set orientation inside the mutex so we dont read a mangled 
-      // quat due to imu thread getting time sliced
-      odom_msg.pose.pose.orientation = imu_msg.orientation;
+      // odom pose estimate is just our current theta estimate
+      odom_msg.pose.pose.orientation = tf::createQuaternionFromYaw(curTheta);
       pub_odom.publish(&odom_msg);
       
       nh.spinOnce();
-      xSemaphoreGive( rsSem ); // Now free or "Give" the Serial Port for others.
+      xSemaphoreGive( rsSem );
     }
     
     // delay 1/dTime seconds
@@ -611,17 +538,15 @@ static void odomThread( void *pvParameters )
 }
 
 //*************************************************************************************
-// Motor thread, creates telemetry on motor currents and battery voltage, as well
+// Telemetry thread, creates telemetry on motor currents and battery voltage, as well
 // as system 5v current draw
-// TODO: create separate telemetry thread or rename this thread to be more telemetry in
-//       general
 //*************************************************************************************
 
-static void motorThread( void *pvParameters )
+static void telemThread( void *pvParameters )
 {
   #ifdef DEBUG
   if ( xSemaphoreTake( dbSem, ( TickType_t ) 100 ) == pdTRUE ) {
-    Serial.println("Motor thread started");
+    Serial.println("Telemetry thread started");
     xSemaphoreGive( dbSem ); // Now free or "Give" the Serial Port for others.
   }
   #endif
@@ -630,8 +555,17 @@ static void motorThread( void *pvParameters )
   motors.enable();
 
   while(1) {
-    myDelayMs(1000);
+    myDelayMs(200);
     motors.update();
+    
+    telem_msg.m1_current = motors.getM1Current();
+    telem_msg.m2_current = motors.getM2Current();
+    telem_msg.battery_voltage = shield.getBatteryVoltage();
+    telem_msg.system_current = shield.get5vCurrent();
+    
+    if( motors.fault() ){
+      motors.disable();
+    }
     
     if ( xSemaphoreTake( dbSem, ( TickType_t ) 300 ) == pdTRUE ) {
     
@@ -648,7 +582,6 @@ static void motorThread( void *pvParameters )
       
       if( motors.fault() ){
         Serial.println("motor fault, disabling both motors");
-        motors.disable();
       }
       
 
@@ -658,8 +591,21 @@ static void motorThread( void *pvParameters )
       
       xSemaphoreGive( dbSem );
     }
+    
+    // check rosserial publish semaphore wait 5 ticks if not available
+    if ( xSemaphoreTake( rsSem, ( TickType_t ) 5 ) == pdTRUE ) {
+      // publish the imu message 
+      pub_telem.publish(&telem_msg);
+      nh.spinOnce();
+      xSemaphoreGive( rsSem );
+    }
+      
+    // tasks can override each other with blinks without semaphore
+    // but eh more blinks
+    ledOk(true);
   }
   
+  motors.disable();
   vTaskDelete( NULL );  
 }
 
@@ -671,39 +617,48 @@ static void imuThread( void *pvParameters )
     xSemaphoreGive( dbSem ); // Now free or "Give" the Serial Port for others.
   }
   #endif
+  
+  unsigned long now = 0, lastNow = 0;
 
+  // continually get most recent IMU data and update AHRS filter
   while(1) {
+  
+    unsigned long now = millis();
     
-    // only update IMU and send ros messages when there is new data
-    // TODO: protect I2C with semaphore
-    if( myICM.dataReady() ){
-      //Serial.println("getting data");
+    if( now - lastNow > IMU_PERIOD ){
+      lastNow = now;
       
-      myICM.getAGMT(); 
+      sensors_event_t accel_event;
+      sensors_event_t gyro_event;
+      sensors_event_t mag_event;
+
+      // Get new data samples
+      myICM.getEvent(&accel_event, &gyro_event, &mag_event);
+
+      // Apply mag offset compensation (base values in uTesla)
+      float x = mag_event.magnetic.x - mag_offsets[0];
+      float y = mag_event.magnetic.y - mag_offsets[1];
+      float z = mag_event.magnetic.z - mag_offsets[2];
+
+      // Apply mag soft iron error compensation
+      float mx = x * mag_softiron_matrix[0][0] + y * mag_softiron_matrix[0][1] + z * mag_softiron_matrix[0][2];
+      float my = x * mag_softiron_matrix[1][0] + y * mag_softiron_matrix[1][1] + z * mag_softiron_matrix[1][2];
+      float mz = x * mag_softiron_matrix[2][0] + y * mag_softiron_matrix[2][1] + z * mag_softiron_matrix[2][2];
+
+      // Apply gyro zero-rate error compensation
+      float gx = gyro_event.gyro.x + gyro_zero_offsets[0];
+      float gy = gyro_event.gyro.y + gyro_zero_offsets[1];
+      float gz = gyro_event.gyro.z + gyro_zero_offsets[2];
+
+      // Update the filter
+      filter.update(gx, gy, gz,
+                    accel_event.acceleration.x, accel_event.acceleration.y, accel_event.acceleration.z,
+                    mx, my, mz);
       
-      imu_msg.linear_acceleration.x = myICM.accX();
-      imu_msg.linear_acceleration.y = myICM.accY();
-      imu_msg.linear_acceleration.z = myICM.accZ();
-      imu_msg.angular_velocity.x = myICM.gyrX();
-      imu_msg.angular_velocity.y = myICM.gyrY();
-      imu_msg.angular_velocity.z = myICM.gyrZ();
-      
-      filter.updateIMU(imu_msg.angular_velocity.x,
-                    imu_msg.angular_velocity.y,
-                    imu_msg.angular_velocity.z,
-                    imu_msg.linear_acceleration.x,
-                    imu_msg.linear_acceleration.y,
-                    imu_msg.linear_acceleration.z);/*,
-                    myICM.magX(),
-                    myICM.magY(),
-                    myICM.magZ());*/
-                    
       float roll = filter.getRoll();
       float pitch = filter.getPitch();
       float heading = filter.getYaw();
-      
-      imu_msg.header.stamp = nh.now();
-      
+        
       geometry_msgs::Quaternion q;
       
       float c1 = cos(pitch/2);
@@ -721,25 +676,26 @@ static void imuThread( void *pvParameters )
       
       // check rosserial publish semaphore wait 5 ticks if not available
       if ( xSemaphoreTake( rsSem, ( TickType_t ) 5 ) == pdTRUE ) {
+        // set timestamp inside semaphore since it uses the nh object
+        imu_msg.header.stamp = nh.now();
+      
         // TODO: quick and dirty way to not have a separate mutex just for the quat
         //       keeps odom thread from possibly interfering while
         //       grabbing the most recent orientation for the Odometry message
-        imu_msg.orientation = q;
+        imu_msg.pose.orientation = q;
         
         // publish the imu message 
         pub_imu.publish(&imu_msg);
         nh.spinOnce();
-        xSemaphoreGive( rsSem ); // Now free or "Give" the Serial Port for others.
+        xSemaphoreGive( rsSem );
       }
       
       // tasks can override each other with blinks without semaphore
       // but eh more blinks
       ledOk(true);
-
-      
     } else {
-      myDelayMs(5);
-    } 
+      myDelayMs(min(IMU_PERIOD-5, max( 0, IMU_PERIOD - (now - lastNow))));
+    }
   }
     
   vTaskDelete( NULL );  
@@ -756,7 +712,7 @@ void setup()
   pinMode(ACT_LED, OUTPUT);
   
   ledErr();
-  nh.getHardware()->setBaud(128000);  
+  nh.getHardware()->setBaud(115000);  
   nh.initNode();
   broadcaster.init(nh);
   nh.advertise(pub_imu);
@@ -819,9 +775,9 @@ void setup()
   // Begin RTOS Setup
   vSetErrorLed(STAT_LED, 1);
 
-  xTaskCreate(motorThread, "Motor Controller Telemetry", 512, NULL, tskIDLE_PRIORITY + 2, &Handle_motorTask);
+  xTaskCreate(telemThread, "Telemetry Logging", 512, NULL, tskIDLE_PRIORITY + 3, &Handle_telemTask);
   xTaskCreate(speedThread, "Speed and Position Control", 512, NULL, tskIDLE_PRIORITY + 3, &Handle_speedTask);
-  xTaskCreate(odomThread, "Odometry Publishing", 512, NULL, tskIDLE_PRIORITY + 2, &Handle_odomTask);
+  xTaskCreate(odomThread, "Odometry Publishing", 512, NULL, tskIDLE_PRIORITY + 3, &Handle_odomTask);
   xTaskCreate(imuThread, "IMU Processing", 512, NULL, tskIDLE_PRIORITY + 3, &Handle_imuTask);
   xTaskCreate(taskMonitor, "Task Monitor", 256, NULL, tskIDLE_PRIORITY + 3, &Handle_monitorTask);
 
