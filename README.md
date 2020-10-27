@@ -64,6 +64,11 @@ Libraries to install with IDE/CLI:
 ```rosrun rosserial_arduino make_libraries.py PathToYourSketchbookLibraries```
 which will generate the arduino library needed. For more information on getting a ROS catkin workspace setup, the [ROS melodic installation homepage](http://wiki.ros.org/ROS/Installation)
 
+Additionally, you need to change the ros.h configuration to add the correct buffer size. Under the #else, change the typedef to the following: 
+
+```
+  typedef NodeHandle_<ArduinoHardware, 10, 10, 2048, 2048> NodeHandle; // default 25, 25, 512, 512
+```
 
 
 ## Compilation

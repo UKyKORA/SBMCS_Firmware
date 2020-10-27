@@ -45,9 +45,9 @@
 // counts per revolution
 #define ENCODER_CPR 2442.96 // in counts
 // wheel circumference
-#define WHEEL_CIRC 0.468 // meters
+#define WHEEL_CIRC 0.798 // meters
 // distance between drive wheels
-#define BASE_WIDTH 0.352 // meters
+#define BASE_WIDTH 0.382 // meters
 // encoder counts per meter
 #define ENCODER_CPM 5220.0 // in counts
 #define MIN_SPD_THRESH 0.005 // slowest we are willing to go in m/s
@@ -115,7 +115,6 @@ SemaphoreHandle_t dbSem;
 // rosserial callback for setting drive velocity
 void twistCb( const geometry_msgs::Twist &cmdVel ){
   // joy_twist_remap was need to send linear.x and angular.z
-  
   float linear_x = cmdVel.linear.x;
 
   float vr = linear_x + cmdVel.angular.z * BASE_WIDTH / 2.0;
@@ -123,6 +122,22 @@ void twistCb( const geometry_msgs::Twist &cmdVel ){
 
   m1TargetVel = vr; //cmdVel.linear.y;
   m2TargetVel = vl; //cmdVel.linear.y;
+
+  #ifdef DEBUG
+  /*if ( xSemaphoreTake( dbSem, ( TickType_t ) 1000 ) == pdTRUE ) {
+    Serial.print("Received velocity message: (");
+    Serial.print(linear_x);
+    Serial.print(", ");
+    Serial.print(cmdVel.angular.z);
+    Serial.println(")");
+    Serial.print("Computed targets: (");
+    Serial.print(m1TargetVel);
+    Serial.print(", ");
+    Serial.print(m2TargetVel);
+    Serial.println(")");
+    xSemaphoreGive( dbSem );
+  }*/
+  #endif
   //lastTwistStamp = millis();
   ledErr(); // TODO: not an erro, just want red blink
             // need rename/rework led indication
@@ -373,16 +388,39 @@ static void speedThread( void *pvParameters )
 
     m1PID.Compute();
     m2PID.Compute();
-
+    #ifdef DEBUG
+    /*if ( xSemaphoreTake( dbSem, ( TickType_t ) 1000 ) == pdTRUE ) {
+      Serial.print("Target speeds: (");
+      Serial.print(m1Setpoint);
+      Serial.print(", ");
+      Serial.print(m2Setpoint);
+      Serial.print(")\tCurrent speeds: (");
+      Serial.print(m1Spd);
+      Serial.print(", ");
+      Serial.print(m2Spd);
+      Serial.println(")");
+      xSemaphoreGive( dbSem );
+    }*/
+    #endif
 
     // TODO: do another speed calibration that includes both
-    //       directions. inverting  a one directional mapping like
+    //       directions. inverting a one directional mapping like
     //       this jerks the motors on speeds close to zero sometimes 
     float m1PwmEstimate = 195.414*m1Output*2.0 + 6.73-255;
     float m2PwmEstimate = 189.719*m2Output*2.0 + 5.49-255;
     m1PwmEstimate = max(-255, min(m1PwmEstimate, 255));
     m2PwmEstimate = max(-255, min(m2PwmEstimate, 255));
 
+    #ifdef DEBUG
+    /*if ( xSemaphoreTake( dbSem, ( TickType_t ) 1000 ) == pdTRUE ) {
+      Serial.print("Motor PWM Estimates: (");
+      Serial.print(m1PwmEstimate);
+      Serial.print(", ");
+      Serial.print(m2PwmEstimate);
+      Serial.println(")");
+      xSemaphoreGive( dbSem );
+    }*/
+    #endif
     // set motor direction based on sign of setpoint
     // this method might cause jerkiness
     if( m1PwmEstimate > 0 ) {
@@ -712,7 +750,7 @@ void setup()
   pinMode(ACT_LED, OUTPUT);
   
   ledErr();
-  nh.getHardware()->setBaud(115000);  
+  nh.getHardware()->setBaud(115200);  
   nh.initNode();
   broadcaster.init(nh);
   nh.advertise(pub_imu);
